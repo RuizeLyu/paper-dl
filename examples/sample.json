@@ -1,0 +1,18 @@
+[
+  {
+    "link": "https://www.arxiv.org/abs/2509.07764",
+    "title": "AgentSentinel: An End-to-End and Real-Time Security Defense Framework for Computer-Use Agents",
+    "publish_time": "20250909",
+    "authors": ["Haitao Hu", "Peng Chen", "Yanpeng Zhao", "Yuqi Chen"],
+    "abstract": "Large Language Models (LLMs) have been increasingly integrated into computer-use agents...",
+    "score": 0.9927424192428589
+  },
+  {
+    "link": "https://www.arxiv.org/abs/2510.02373",
+    "title": "A-MemGuard: A Proactive Defense Framework for LLM-Based Agent Memory",
+    "publish_time": "20250929",
+    "authors": ["Qianshan Wei", "Tengchao Yang", "Yaochen Wang"],
+    "abstract": "Large Language Model (LLM) agents use memory to learn from past interactions...",
+    "score": 0.9898982048034668
+  }
+]
