@@ -50,24 +50,37 @@ class TestPaperArxivId(unittest.TestCase):
 
 class TestPaperSafeFilename(unittest.TestCase):
     def test_basic(self):
-        p = Paper(title="My Paper", link="")
-        self.assertEqual(p.safe_filename, "My Paper.pdf")
+        p = Paper(title="My Paper", link="https://arxiv.org/abs/2001.00001")
+        self.assertEqual(p.safe_filename, "My Paper [2001.00001].pdf")
 
     def test_invalid_chars_replaced(self):
-        p = Paper(title='Paper: A/B "Test"', link="")
+        p = Paper(title='Paper: A/B "Test"', link="https://arxiv.org/abs/2001.00001")
         self.assertNotIn(":", p.safe_filename)
         self.assertNotIn("/", p.safe_filename)
         self.assertNotIn('"', p.safe_filename)
         self.assertTrue(p.safe_filename.endswith(".pdf"))
 
     def test_long_title_truncated(self):
-        p = Paper(title="A" * 200, link="")
-        # filename = title (<=100) + ".pdf"
-        self.assertLessEqual(len(p.safe_filename), 105)
+        p = Paper(title="A" * 200, link="https://arxiv.org/abs/2001.00001")
+        # filename = title (<=100) + " [id]" + ".pdf"
+        self.assertLessEqual(len(p.safe_filename), 120)
 
     def test_extra_whitespace_collapsed(self):
-        p = Paper(title="A   B", link="")
-        self.assertEqual(p.safe_filename, "A B.pdf")
+        p = Paper(title="A   B", link="https://arxiv.org/abs/2001.00001")
+        self.assertEqual(p.safe_filename, "A B [2001.00001].pdf")
+
+    def test_empty_title_fallback(self):
+        p = Paper(title="///", link="https://arxiv.org/abs/2001.00001")
+        self.assertIn("2001.00001", p.safe_filename)
+        self.assertTrue(p.safe_filename.endswith(".pdf"))
+
+    def test_all_special_chars_title(self):
+        p = Paper(title='***', link="")
+        self.assertEqual(p.safe_filename, "___.pdf")
+
+    def test_no_arxiv_id_no_collision_suffix(self):
+        p = Paper(title="My Paper", link="https://example.com")
+        self.assertEqual(p.safe_filename, "My Paper.pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +88,10 @@ class TestPaperSafeFilename(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestLoadPapers(unittest.TestCase):
-    def _write_json(self, data, tmp_dir):
+    def _write_json(self, content, tmp_dir):
         path = Path(tmp_dir) / "papers.json"
-        path.write_text(json.dumps(data), encoding="utf-8")
+        path.write_text(content if isinstance(content, str) else json.dumps(content),
+                        encoding="utf-8")
         return path
 
     def test_valid_entries(self):
@@ -129,6 +143,24 @@ class TestLoadPapers(unittest.TestCase):
             papers = load_papers(path)
         self.assertEqual(len(papers), 1)
 
+    def test_invalid_json_raises_system_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json("{not valid json", tmp)
+            with self.assertRaises(SystemExit):
+                load_papers(path)
+
+    def test_non_list_root_raises_system_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json({"key": "value"}, tmp)
+            with self.assertRaises(SystemExit):
+                load_papers(path)
+
+    def test_non_dict_entries_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_json(["string_entry", 123], tmp)
+            papers = load_papers(path)
+        self.assertEqual(papers, [])
+
 
 # ---------------------------------------------------------------------------
 # _download_one
@@ -161,7 +193,7 @@ class TestDownloadOne(unittest.TestCase):
     def test_successful_download(self, mock_urlopen):
         fake_pdf = b"%PDF-1.4 fake content"
         mock_resp = MagicMock()
-        mock_resp.read.return_value = fake_pdf
+        mock_resp.read.side_effect = [fake_pdf, b""]
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
@@ -171,6 +203,7 @@ class TestDownloadOne(unittest.TestCase):
             dest = Path(tmp) / "test.pdf"
             result = _download_one(paper, dest)
             self.assertEqual(result.status, "ok")
+            self.assertTrue(dest.exists())
             self.assertEqual(dest.read_bytes(), fake_pdf)
 
     @patch("paper_dl.downloader.urllib.request.urlopen")
@@ -189,7 +222,7 @@ class TestDownloadOne(unittest.TestCase):
     @patch("paper_dl.downloader.urllib.request.urlopen")
     def test_fails_when_response_is_not_pdf(self, mock_urlopen):
         mock_resp = MagicMock()
-        mock_resp.read.return_value = b"<html>not a pdf</html>"
+        mock_resp.read.side_effect = [b"<html>not a pdf</html>", b""]
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
@@ -205,10 +238,9 @@ class TestDownloadOne(unittest.TestCase):
     @patch("paper_dl.downloader.urllib.request.urlopen")
     def test_retries_on_server_error(self, mock_urlopen, mock_sleep):
         import urllib.error
-        # First two attempts: 500 error. Third: success.
         fake_pdf = b"%PDF-ok"
         mock_resp = MagicMock()
-        mock_resp.read.return_value = fake_pdf
+        mock_resp.read.side_effect = [fake_pdf, b""]
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
@@ -224,6 +256,36 @@ class TestDownloadOne(unittest.TestCase):
             result = _download_one(paper, dest, retries=3)
         self.assertEqual(result.status, "ok")
         self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch("paper_dl.downloader.time.sleep")
+    @patch("paper_dl.downloader.urllib.request.urlopen")
+    def test_last_retry_preserves_http_code(self, mock_urlopen, mock_sleep):
+        import urllib.error
+        mock_urlopen.side_effect = [
+            urllib.error.HTTPError("", 503, "Service Unavailable", None, None),
+            urllib.error.HTTPError("", 503, "Service Unavailable", None, None),
+        ]
+
+        paper = self._make_paper()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "test.pdf"
+            result = _download_one(paper, dest, retries=2)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("503", result.reason)
+
+    @patch("paper_dl.downloader.urllib.request.urlopen")
+    def test_no_tmp_file_left_on_failure(self, mock_urlopen):
+        import urllib.error
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="", code=404, msg="Not Found", hdrs=None, fp=None
+        )
+        paper = self._make_paper()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "test.pdf"
+            _download_one(paper, dest, retries=1)
+            tmp_file = dest.with_suffix(".pdf.tmp")
+            self.assertFalse(tmp_file.exists())
 
 
 if __name__ == "__main__":

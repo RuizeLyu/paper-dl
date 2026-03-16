@@ -71,6 +71,10 @@ def main() -> None:
         print("Error: concurrency must be >= 1", file=sys.stderr)
         sys.exit(1)
 
+    if args.retries < 1:
+        print("Error: retries must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     download_papers(
         json_path=json_path,
         output_dir=args.output,

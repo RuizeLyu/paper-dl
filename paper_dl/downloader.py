@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -23,6 +24,7 @@ _HEADERS = {
     )
 }
 
+# Matches arxiv IDs like 2301.12345 or 2301.12345v2
 _ARXIV_ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})")
 _INVALID_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 
@@ -49,6 +51,10 @@ class Paper:
         name = re.sub(r"\s+", " ", name).strip()
         if len(name) > 100:
             name = name[:100].rstrip()
+        # Fallback for empty names; append arxiv ID to avoid collisions
+        name = name or "unknown"
+        if self.arxiv_id:
+            name = f"{name} [{self.arxiv_id}]"
         return f"{name}.pdf"
 
 
@@ -61,10 +67,19 @@ class DownloadResult:
 
 def load_papers(json_path: Path) -> list[Paper]:
     """Parse a pasa-format JSON file into Paper objects."""
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Error: invalid JSON in {json_path}: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise SystemExit(f"Error: expected a JSON array, got {type(data).__name__}")
+
     papers = []
     for entry in data:
+        if not isinstance(entry, dict):
+            continue
         title = entry.get("title", "").strip()
         link = entry.get("link", "").strip()
         if title and link:
@@ -82,38 +97,56 @@ def _download_one(paper: Paper, dest: Path, retries: int = 3) -> DownloadResult:
             paper=paper, status="failed", reason=f"cannot parse arxiv ID from: {paper.link}"
         )
 
+    tmp_dest = dest.with_suffix(".pdf.tmp")
+    last_error: str = "max retries exceeded"
+
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(paper.pdf_url, headers=_HEADERS)
             with urllib.request.urlopen(req, timeout=60) as resp:
-                content = resp.read()
+                first_chunk = resp.read(65536)
+                if not first_chunk or not first_chunk.startswith(b"%PDF"):
+                    last_error = "response is not a valid PDF"
+                    if attempt < retries:
+                        time.sleep(3 * attempt)
+                        continue
+                    return DownloadResult(
+                        paper=paper, status="failed", reason=last_error
+                    )
 
-            if not content.startswith(b"%PDF"):
-                if attempt < retries:
-                    time.sleep(3 * attempt)
-                    continue
-                return DownloadResult(
-                    paper=paper, status="failed", reason="response is not a valid PDF"
-                )
+                with open(tmp_dest, "wb") as f:
+                    f.write(first_chunk)
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
 
-            dest.write_bytes(content)
+            os.replace(tmp_dest, dest)
             return DownloadResult(paper=paper, status="ok")
 
         except urllib.error.HTTPError as e:
+            tmp_dest.unlink(missing_ok=True)
+            last_error = f"HTTP {e.code}"
             if e.code in (403, 404):
                 return DownloadResult(
-                    paper=paper, status="failed", reason=f"HTTP {e.code}"
+                    paper=paper, status="failed", reason=last_error
                 )
             if attempt < retries:
                 time.sleep(5 * attempt)
 
+        except OSError as e:
+            tmp_dest.unlink(missing_ok=True)
+            last_error = f"write error: {e}"
+            return DownloadResult(paper=paper, status="failed", reason=last_error)
+
         except Exception as e:  # noqa: BLE001
+            tmp_dest.unlink(missing_ok=True)
+            last_error = str(e)
             if attempt < retries:
                 time.sleep(5 * attempt)
-            else:
-                return DownloadResult(paper=paper, status="failed", reason=str(e))
 
-    return DownloadResult(paper=paper, status="failed", reason="max retries exceeded")
+    return DownloadResult(paper=paper, status="failed", reason=last_error)
 
 
 def download_papers(
@@ -153,16 +186,19 @@ def download_papers(
 
         with tqdm(total=len(papers), unit="paper", ncols=80) as bar:
             for future in as_completed(futures):
-                result: DownloadResult = future.result()
+                try:
+                    result: DownloadResult = future.result()
+                except Exception as exc:
+                    paper = futures[future]
+                    result = DownloadResult(paper=paper, status="failed", reason=str(exc))
+
                 if result.status == "ok":
                     ok.append(result)
-                    bar.set_postfix_str(f"OK: {len(ok)}", refresh=False)
                 elif result.status == "skipped":
                     skipped.append(result)
-                    bar.set_postfix_str(f"skip: {len(skipped)}", refresh=False)
                 else:
                     failed.append(result)
-                    bar.set_postfix_str(f"fail: {len(failed)}", refresh=False)
+                bar.set_postfix(OK=len(ok), skip=len(skipped), fail=len(failed), refresh=False)
                 bar.update(1)
 
     # Write failed list
